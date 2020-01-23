@@ -1,4 +1,9 @@
 Apache Thrift Changelog
+Thrift 0.0.2.1
+--------------------------------------------------------------------------------
+## add feature
+    * support flat protocol, golang Read/Write list generated code
+    * simplifify golang list read code, "if size == 0, then goto read end"
 
 Thrift 0.9.2
 --------------------------------------------------------------------------------

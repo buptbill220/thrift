@@ -747,6 +747,8 @@ string t_go_generator::go_imports_begin()
         string("import (\n"
                 "\t\"bytes\"\n"
                 "\t\"fmt\"\n"
+                "\t\"reflect\"\n"
+                "\t\"unsafe\"\n"
                "\t\"" + gen_thrift_import_ + "\"\n");
 }
 
@@ -764,7 +766,10 @@ string t_go_generator::go_imports_end()
             "// (needed to ensure safety because of naive import list construction.)\n"
             "var _ = thrift.ZERO\n"
             "var _ = fmt.Printf\n"
-        	"var _ = bytes.Equal\n\n");
+            "var _ = bytes.Equal\n"
+            "var _ = unsafe.Sizeof(false)\n"
+            "var _ = reflect.Bool\n\n"
+         );
 }
 
 /**
@@ -2778,13 +2783,21 @@ void t_go_generator::generate_deserialize_container(ofstream &out,
     }
 
     // Declare variables, read header
+    t_type* elem_type = NULL;
     if (ttype->is_map()) {
         out <<
             indent() << "_, _, size, err := iprot.ReadMapBegin()" << endl <<
             indent() << "if err != nil {" << endl <<
             indent() << "  return fmt.Errorf(\"error reading map begin: %s\", err)" << endl <<
             indent() << "}" << endl <<
-            indent() << "tMap := make(" << type_to_go_type(orig_type) << ", size)" << endl <<
+            indent() << "var tMap " << type_to_go_type(orig_type) << endl <<
+            indent() << "if size == 0 {" << endl;
+        indent_up();
+            out <<
+                indent() << "goto read_end" << endl;
+        indent_down();
+        out << indent() << "}" << endl <<
+            indent() << "tMap = make(" << type_to_go_type(orig_type) << ", size)" << endl <<
             indent() << prefix << eq << " " << (pointer_field ? "&" : "") << "tMap" << endl;
     } else if (ttype->is_set()) {
         t_set* t = (t_set*)ttype;
@@ -2793,40 +2806,134 @@ void t_go_generator::generate_deserialize_container(ofstream &out,
             indent() << "if err != nil {" << endl <<
             indent() << "  return fmt.Errorf(\"error reading set begin: %s\", err)" << endl <<
             indent() << "}" << endl <<
-            indent() << "tSet := make(map[" << type_to_go_key_type(t->get_elem_type()->get_true_type()) << "]bool, size)" << endl <<
+            indent() << "var tSet map[" << type_to_go_key_type(t->get_elem_type()->get_true_type()) << "]bool" << endl <<
+            indent() << "if size == 0 {" << endl;
+        indent_up();
+        out <<
+            indent() << "goto read_end" << endl;
+        indent_down();
+        out << indent() << "}" << endl <<
+            indent() << "tSet = make(map[" << type_to_go_key_type(t->get_elem_type()->get_true_type()) << "]bool, size)" << endl <<
             indent() << prefix << eq << " " << (pointer_field ? "&" : "") << "tSet" << endl;
     } else if (ttype->is_list()) {
+        t_list* t = (t_list*)ttype;
+        elem_type = t->get_elem_type();
         out <<
             indent() << "_, size, err := iprot.ReadListBegin()" << endl <<
             indent() << "if err != nil {" << endl <<
             indent() << "  return fmt.Errorf(\"error reading list begin: %s\", err)" << endl <<
             indent() << "}" << endl <<
-            indent() << "tSlice := make(" << type_to_go_type(orig_type) << ", 0, size)" << endl <<
+            indent() << "var tSlice " << type_to_go_type(orig_type) << endl <<
+            indent() << "if size == 0 {" << endl;
+        indent_up();
+        out <<
+            indent() << "goto read_end" << endl;
+        indent_down();
+        out << indent() << "}" << endl <<
+            indent() << "tSlice = make(" << type_to_go_type(orig_type) << ", size)" << endl <<
             indent() << prefix << eq << " " << (pointer_field ? "&" : "") << "tSlice" << endl;
     } else {
         throw "INVALID TYPE IN generate_deserialize_container '" + ttype->get_name() + "' for prefix '" + prefix + "'";
     }
 
-    // For loop iterates over elements
-    out <<
-        indent() << "for i := 0; i < size; i ++ {" << endl;
-    indent_up();
-
-    if (pointer_field) {
-        prefix = "(*" + prefix + ")";
+    bool can_flat = false;
+    int shift_bit = 0;
+    if (elem_type != NULL) {
+        if (elem_type->is_enum() || (elem_type->is_base_type() && !((t_base_type*)elem_type)->is_string())) {
+            can_flat = true;
+            if (elem_type->is_enum()) {
+                shift_bit = 3;
+            } else {
+                t_base_type *b_type = (t_base_type *) elem_type;
+                switch (b_type->get_base()) {
+                    case t_base_type::TYPE_BOOL:
+                        shift_bit = 0;
+                        break;
+                    case t_base_type::TYPE_BYTE:
+                        shift_bit = 0;
+                        break;
+                    case t_base_type::TYPE_I16:
+                        shift_bit = 1;
+                        break;
+                    case t_base_type::TYPE_I32:
+                        shift_bit = 2;
+                        break;
+                    case t_base_type::TYPE_I64:
+                        shift_bit = 3;
+                        break;
+                    case t_base_type::TYPE_DOUBLE:
+                        shift_bit = 3;
+                        break;
+                    default:
+                        shift_bit = 0;
+                }
+            }
+        }
     }
-    if (ttype->is_map()) {
-        generate_deserialize_map_element(out, (t_map*)ttype, declare, prefix);
-    } else if (ttype->is_set()) {
-        generate_deserialize_set_element(out, (t_set*)ttype, declare, prefix);
-    } else if (ttype->is_list()) {
-        generate_deserialize_list_element(out, (t_list*)ttype, declare, prefix);
+    if (can_flat) {
+        if (pointer_field) {
+            prefix = "(*" + prefix + ")";
+        }
+        string elem = tmp("_elem");
+        t_field felem(((t_list*)ttype)->get_elem_type(), elem);
+        felem.set_req(t_field::T_OPT_IN_REQ_OUT);
+        // begin flat write
+        out << indent() << "if oprot.IsFlatRead() {" << endl;
+        indent_up();
+        out <<
+            indent() << "var tmp []byte" << endl <<
+            indent() << "sc := (*reflect.SliceHeader)(unsafe.Pointer(&tmp))" << endl <<
+            indent() << "sc.Data = uintptr(unsafe.Pointer(&tSlice[0]))" << endl <<
+            indent() << "sc.Len = size << " << shift_bit << endl <<
+            indent() << "sc.Cap = sc.Len" << endl <<
+            indent() << "if err := oprot.ReadRaw(tmp); err != nil {" << endl;
+        indent_up();
+        out <<
+            indent() << "return fmt.Errorf(\"error reading field " << felem.get_key() << ": %s\", err)" << endl;
+        indent_down();
+        out << indent() << "}" << endl;
+        indent_down();
+        // end flat write
+        out << indent() << "} else {" << endl;
+        // begin list read
+        indent_up();
+        out <<
+            indent() << prefix << " = " << prefix << "[:0]" << endl <<
+            indent() << "for i := 0; i < size; i ++ {" << endl;
+        indent_up();
+        generate_deserialize_list_element(out, (t_list *) ttype, declare, prefix);
+        indent_down();
+        out <<
+            indent() << "}" << endl;
+        indent_down();
+        out << indent() << "}" << endl;
+    } else {
+        if (pointer_field) {
+            prefix = "(*" + prefix + ")";
+        }
+        if (ttype->is_list()) {
+            out << indent() << prefix << " = " << prefix << "[:0]" << endl;
+        }
+        // For loop iterates over elements
+        out <<
+            indent() << "for i := 0; i < size; i ++ {" << endl;
+        indent_up();
+
+
+        if (ttype->is_map()) {
+            generate_deserialize_map_element(out, (t_map *) ttype, declare, prefix);
+        } else if (ttype->is_set()) {
+            generate_deserialize_set_element(out, (t_set *) ttype, declare, prefix);
+        } else if (ttype->is_list()) {
+            generate_deserialize_list_element(out, (t_list *) ttype, declare, prefix);
+        }
+
+        indent_down();
+        out <<
+            indent() << "}" << endl;
     }
 
-    indent_down();
-    out <<
-        indent() << "}" << endl;
-
+    out << indent() << "read_end:" << endl;
     // Read container end
     if (ttype->is_map()) {
         out <<
@@ -3066,13 +3173,75 @@ void t_go_generator::generate_serialize_container(ofstream &out,
         indent(out) << "}" << endl;
     } else if (ttype->is_list()) {
         t_list* tlist = (t_list*)ttype;
-        out <<
-            indent() << "for _, v := range " << prefix << " {" << endl;
+        t_type* elem_type = tlist->get_elem_type();
+        if (elem_type->is_enum() || (elem_type->is_base_type() && !((t_base_type*)elem_type)->is_string())) {
+            int shift_bit = 0;
+            if (elem_type->is_enum()) {
+                shift_bit = 3;
+            } else {
+                t_base_type *b_type = (t_base_type *) elem_type;
+                switch (b_type->get_base()) {
+                    case t_base_type::TYPE_BOOL:
+                        shift_bit = 0;
+                        break;
+                    case t_base_type::TYPE_BYTE:
+                        shift_bit = 0;
+                        break;
+                    case t_base_type::TYPE_I16:
+                        shift_bit = 1;
+                        break;
+                    case t_base_type::TYPE_I32:
+                        shift_bit = 2;
+                        break;
+                    case t_base_type::TYPE_I64:
+                        shift_bit = 3;
+                        break;
+                    case t_base_type::TYPE_DOUBLE:
+                        shift_bit = 3;
+                        break;
+                    default:
+                        shift_bit = 0;
+                }
+            }
+            // begin flat write
+            out << indent() << "ls := len(" << prefix << ")" << endl;
+            out << indent() << "if ls > 0 && oprot.IsFlatWrite() {" << endl;
+            indent_up();
+            out <<
+                indent() << "var tmp []byte" << endl <<
+                indent() << "sc := (*reflect.SliceHeader)(unsafe.Pointer(&tmp))" << endl <<
+                indent() << "sc.Data = uintptr(unsafe.Pointer(&" << prefix << "[0]))" << endl <<
+                indent() << "sc.Len = ls << " << shift_bit << endl <<
+                indent() << "sc.Cap = sc.Len" << endl <<
+                indent() << "if err := oprot.WriteRaw(tmp); err != nil {" << endl;
+            indent_up();
+            out << indent() << "return fmt.Errorf(\"%T. (0) field write error: %s\", p, err)" << endl;
+            indent_down();
+            out << indent() << "}" << endl;
+            indent_down();
+            // end flat write
+            out << indent() << "} else {" << endl;
+            // begin list write
+            indent_up();
+            out <<
+                indent() << "for _, v := range " << prefix << " {" << endl;
 
-        indent_up();
-        generate_serialize_list_element(out, tlist, "v");
-        indent_down();
-        indent(out) << "}" << endl;
+            indent_up();
+            generate_serialize_list_element(out, tlist, "v");
+            indent_down();
+            indent(out) << "}" << endl;
+            indent_down();
+            out << indent() << "}" << endl;
+            // end list write
+        } else {
+            out <<
+                indent() << "for _, v := range " << prefix << " {" << endl;
+
+            indent_up();
+            generate_serialize_list_element(out, tlist, "v");
+            indent_down();
+            indent(out) << "}" << endl;
+        }
     }
 
     if (ttype->is_map()) {
